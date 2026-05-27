@@ -1,0 +1,12 @@
+jax
+jaxlib
+flax
+optax
+numpy
+pytest
+matplotlib
+tensorflow-datasets
+flax
+optax
+tensorflow
+tqdm

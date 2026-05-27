@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+*.pyc
+.venv/
+.env/
+.ipynb_checkpoints/
+.DS_Store
+data/
+checkpoints/
+work_dirs/
+wandb/
+data/
+outputs/
+*.csv
+EOF
