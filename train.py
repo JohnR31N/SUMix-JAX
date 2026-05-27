@@ -14,7 +14,7 @@ from tqdm import tqdm
 from cutmix_jax.datasets import get_cifar10_dataset, numpy_iterator
 from cutmix_jax.losses import classification_loss, cutmix_loss
 from cutmix_jax.cutmix import cutmix_batch
-from cutmix_jax.sumix import sumix_cutmix_loss
+from cutmix_jax.sumix import sumix_loss
 from cutmix_jax.models.small_cnn import SmallCNN
 from cutmix_jax.models.pyramidnet import PyramidNet
 from cutmix_jax.models.resnet import ResNet18
@@ -67,8 +67,7 @@ def parse_args():
     parser.add_argument("--cutmix-alpha", type=float, default=1.0)
     parser.add_argument("--cutmix-prob", type=float, default=1.0)
 
-    parser.add_argument("--sumix-beta", type=float, default=0.1)
-    parser.add_argument("--sumix-temperature", type=float, default=1.0)
+    parser.add_argument("--sumix-gamma", type=float, default=0.1)
 
     parser.add_argument("--pyramid-depth", type=int, default=20)
     parser.add_argument("--pyramid-alpha", type=int, default=48)
@@ -93,6 +92,7 @@ def create_model(args, num_classes: int):
         return ResNet18(
             num_classes=num_classes,
             base_width=64,
+            use_sumix_head=(args.aug == "cutmix_sumix"),
         )
 
     raise ValueError(f"Unsupported model: {args.model}")
@@ -196,6 +196,22 @@ def create_train_state(rng, model, args, steps_per_epoch: int):
     )
 
 
+def get_logits(outputs):
+    """
+    Normal model returns:
+        logits
+
+    SUMix model returns:
+        cls_logits, uncertain_logits
+
+    This helper extracts cls_logits.
+    """
+    if isinstance(outputs, tuple):
+        return outputs[0]
+
+    return outputs
+
+
 @jax.jit
 def train_step_baseline(state, batch):
     images = jnp.asarray(batch["image"])
@@ -207,14 +223,16 @@ def train_step_baseline(state, batch):
             "batch_stats": state.batch_stats,
         }
 
-        logits, new_model_state = state.apply_fn(
+        outputs, new_model_state = state.apply_fn(
             variables,
             images,
             train=True,
             mutable=["batch_stats"],
         )
 
+        logits = get_logits(outputs)
         loss = classification_loss(logits, labels)
+
         return loss, (logits, new_model_state)
 
     (loss, (logits, new_model_state)), grads = jax.value_and_grad(
@@ -251,14 +269,16 @@ def train_step_cutmix(state, batch, rng, cutmix_alpha: float):
             "batch_stats": state.batch_stats,
         }
 
-        logits, new_model_state = state.apply_fn(
+        outputs, new_model_state = state.apply_fn(
             variables,
             mixed_images,
             train=True,
             mutable=["batch_stats"],
         )
 
+        logits = get_logits(outputs)
         loss = cutmix_loss(logits, info)
+
         return loss, (logits, new_model_state)
 
     (loss, (logits, new_model_state)), grads = jax.value_and_grad(
@@ -280,15 +300,14 @@ def train_step_cutmix(state, batch, rng, cutmix_alpha: float):
 
 @partial(
     jax.jit,
-    static_argnames=("cutmix_alpha", "sumix_beta", "sumix_temperature"),
+    static_argnames=("cutmix_alpha", "sumix_gamma"),
 )
 def train_step_cutmix_sumix(
     state,
     batch,
     rng,
     cutmix_alpha: float,
-    sumix_beta: float,
-    sumix_temperature: float,
+    sumix_gamma: float,
 ):
     images = jnp.asarray(batch["image"])
     labels = jnp.asarray(batch["label"])
@@ -300,46 +319,41 @@ def train_step_cutmix_sumix(
         alpha=cutmix_alpha,
     )
 
-    images_b = images[info["perm"]]
-
     def loss_fn(params):
         variables = {
             "params": params,
             "batch_stats": state.batch_stats,
         }
 
-        logits_a = state.apply_fn(
+        cls_one, uncertain_one = state.apply_fn(
             variables,
             images,
             train=False,
             mutable=False,
         )
 
-        logits_b = state.apply_fn(
-            variables,
-            images_b,
-            train=False,
-            mutable=False,
-        )
-
-        logits_mix, new_model_state = state.apply_fn(
+        outputs_mix, new_model_state = state.apply_fn(
             variables,
             mixed_images,
             train=True,
             mutable=["batch_stats"],
         )
 
-        loss, sumix_info = sumix_cutmix_loss(
-            logits_mix=logits_mix,
-            logits_a=logits_a,
-            logits_b=logits_b,
+        cls_mix, uncertain_mix = outputs_mix
+
+        loss, sumix_info = sumix_loss(
+            cls_one=cls_one,
+            uncertain_one=uncertain_one,
+            cls_mix=cls_mix,
+            uncertain_mix=uncertain_mix,
             labels_a=info["labels_a"],
             labels_b=info["labels_b"],
-            beta=sumix_beta,
-            temperature=sumix_temperature,
+            perm=info["perm"],
+            lam_area=info["lam"],
+            gamma=sumix_gamma,
         )
 
-        return loss, (logits_mix, new_model_state, sumix_info)
+        return loss, (cls_mix, new_model_state, sumix_info)
 
     (loss, (logits, new_model_state, sumix_info)), grads = jax.value_and_grad(
         loss_fn,
@@ -356,8 +370,7 @@ def train_step_cutmix_sumix(
         "acc": acc,
         "lam": sumix_info["lam"],
         "cls_loss": sumix_info["cls_loss"],
-        "uncertainty_loss": sumix_info["uncertainty_loss"],
-        "uncertainty": sumix_info["uncertainty"],
+        "reg_loss": sumix_info["reg_loss"],
     }
 
 
@@ -371,12 +384,14 @@ def eval_step(state, batch):
         "batch_stats": state.batch_stats,
     }
 
-    logits = state.apply_fn(
+    outputs = state.apply_fn(
         variables,
         images,
         train=False,
         mutable=False,
     )
+
+    logits = get_logits(outputs)
 
     loss = classification_loss(logits, labels)
     acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
@@ -427,8 +442,7 @@ def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int
                         batch,
                         step_rng,
                         args.cutmix_alpha,
-                        args.sumix_beta,
-                        args.sumix_temperature,
+                        args.sumix_gamma,
                     )
 
                 train_lams.append(float(metrics["lam"]))
@@ -462,7 +476,9 @@ def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int
         "loss": sum(train_losses) / len(train_losses),
         "acc": sum(train_accs) / len(train_accs),
         "lam": sum(train_lams) / len(train_lams) if train_lams else None,
-        "cutmix_rate": cutmix_count / total_count if args.aug in ["cutmix", "cutmix_sumix"] else 0.0,
+        "cutmix_rate": cutmix_count / total_count
+        if args.aug in ["cutmix", "cutmix_sumix"]
+        else 0.0,
     }
 
     return state, output, rng
@@ -553,8 +569,7 @@ def create_csv_writer(csv_path):
         "lr_gamma",
         "cutmix_alpha",
         "cutmix_prob",
-        "sumix_beta",
-        "sumix_temperature",
+        "sumix_gamma",
     ]
 
     writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -598,8 +613,7 @@ def print_config(args, steps_per_epoch: int, test_steps: int):
         print(f"CutMix prob:        {args.cutmix_prob}")
 
     if args.aug == "cutmix_sumix":
-        print(f"SUMix beta:         {args.sumix_beta}")
-        print(f"SUMix temperature:  {args.sumix_temperature}")
+        print(f"SUMix gamma:        {args.sumix_gamma}")
 
     print(f"Device:             {jax.devices()}")
     print("=" * 80)
@@ -617,7 +631,6 @@ def main():
         data_dir=args.data_dir,
     )
 
-    # TFDS pipeline currently drops remainder, so floor division matches tqdm better.
     steps_per_epoch = num_train_examples // args.batch_size
     test_steps = num_test_examples // args.batch_size
 
@@ -727,8 +740,7 @@ def main():
                     "lr_gamma": args.lr_gamma,
                     "cutmix_alpha": args.cutmix_alpha,
                     "cutmix_prob": args.cutmix_prob,
-                    "sumix_beta": args.sumix_beta if args.aug == "cutmix_sumix" else "",
-                    "sumix_temperature": args.sumix_temperature if args.aug == "cutmix_sumix" else "",
+                    "sumix_gamma": args.sumix_gamma if args.aug == "cutmix_sumix" else "",
                 }
             )
             csv_file.flush()

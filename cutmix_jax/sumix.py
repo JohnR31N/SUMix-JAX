@@ -9,78 +9,209 @@ def cross_entropy_with_integer_labels(logits, labels):
     return -log_probs[batch_indices, labels]
 
 
-def compute_semantic_lambda(logits_mix, logits_a, logits_b, temperature: float = 1.0):
+def l2_normalize(x, axis=-1, eps=1e-8):
+    norm = jnp.sqrt(jnp.sum(x * x, axis=axis, keepdims=True) + eps)
+    return x / norm
+
+
+def gather_by_label(values, labels):
+    batch_indices = jnp.arange(labels.shape[0])
+    return values[batch_indices, labels]
+
+
+def estimate_uncertainty(uncertain_logits):
     """
-    SUMix-style semantic lambda.
+    Uncertainty estimation module.
 
-    If mixed prediction is closer to image A prediction, lambda should be larger.
-    If mixed prediction is closer to image B prediction, lambda should be smaller.
+    Input:
+        uncertain_logits: [B, num_classes]
+
+    Output:
+        normalized uncertainty distribution: [B, num_classes]
     """
-    probs_mix = jnn.softmax(logits_mix / temperature, axis=-1)
-    probs_a = jax.lax.stop_gradient(jnn.softmax(logits_a / temperature, axis=-1))
-    probs_b = jax.lax.stop_gradient(jnn.softmax(logits_b / temperature, axis=-1))
+    uncertain_prob = jnn.softmax(uncertain_logits, axis=-1)
+    uncertain_prob = l2_normalize(uncertain_prob, axis=-1)
 
-    dist_a = jnp.mean((probs_mix - probs_a) ** 2, axis=-1)
-    dist_b = jnp.mean((probs_mix - probs_b) ** 2, axis=-1)
-
-    lam = dist_b / (dist_a + dist_b + 1e-8)
-    lam = jnp.clip(lam, 0.0, 1.0)
-
-    return lam
+    return uncertain_prob
 
 
-def normalized_entropy(logits):
-    probs = jnn.softmax(logits, axis=-1)
-    log_probs = jnn.log_softmax(logits, axis=-1)
+def estimate_semantic_information(cls_logits):
+    """
+    Semantic information from classifier logits.
 
-    entropy = -jnp.sum(probs * log_probs, axis=-1)
-    max_entropy = jnp.log(logits.shape[-1])
+    Input:
+        cls_logits: [B, num_classes]
 
-    return entropy / max_entropy
+    Output:
+        semantic probability distribution: [B, num_classes]
+    """
+    semantic_prob = jnn.softmax(cls_logits, axis=-1)
+
+    return semantic_prob
 
 
-def sumix_cutmix_loss(
-    logits_mix,
-    logits_a,
-    logits_b,
+def estimate_mixup_ratio(
+    cls_one,
+    uncertain_one,
+    cls_mix,
+    uncertain_mix,
     labels_a,
     labels_b,
-    beta: float = 0.1,
-    temperature: float = 1.0,
+    perm,
+    lam_area,
 ):
     """
-    CutMix + SUMix-style loss.
+    SUMix mixup ratio learning / correction.
 
-    Main idea:
-    1. Use semantic distance to estimate lambda.
-    2. Use this lambda for mixed-label classification loss.
-    3. Add uncertainty regularization.
+    cls_one:
+        classifier logits for original images x_a
+
+    uncertain_one:
+        uncertainty logits for original images x_a
+
+    cls_mix:
+        classifier logits for mixed images
+
+    uncertain_mix:
+        uncertainty logits for mixed images
+
+    labels_a, labels_b:
+        original labels and shuffled labels
+
+    perm:
+        shuffle index from CutMix
+
+    lam_area:
+        CutMix area lambda
     """
-    lam = compute_semantic_lambda(
-        logits_mix=logits_mix,
-        logits_a=logits_a,
-        logits_b=logits_b,
-        temperature=temperature,
+
+    batch_size = labels_a.shape[0]
+
+    if jnp.ndim(lam_area) == 0:
+        lam_area = jnp.ones((batch_size,), dtype=cls_mix.dtype) * lam_area
+
+    lam_area = lam_area.reshape(-1)
+
+    semantic_one = estimate_semantic_information(cls_one)
+    semantic_mix = estimate_semantic_information(cls_mix)
+
+    semantic_one = jax.lax.stop_gradient(semantic_one)
+    semantic_mix = jax.lax.stop_gradient(semantic_mix)
+
+    semantic_b = semantic_one[perm]
+
+    uncertain_one = estimate_uncertainty(uncertain_one)
+    uncertain_mix = estimate_uncertainty(uncertain_mix)
+
+    uncertain_b = uncertain_one[perm]
+
+    semantic_diff_a = semantic_mix - semantic_one
+    semantic_diff_b = semantic_mix - semantic_b
+
+    alpha_a = l2_normalize(
+        jnn.softmax(semantic_diff_a, axis=-1),
+        axis=-1,
     )
 
-    loss_a = cross_entropy_with_integer_labels(logits_mix, labels_a)
-    loss_b = cross_entropy_with_integer_labels(logits_mix, labels_b)
-
-    cls_loss = jnp.mean(lam * loss_a + (1.0 - lam) * loss_b)
-
-    uncertainty = normalized_entropy(logits_mix)
-
-    target_uncertainty = jax.lax.stop_gradient(
-        4.0 * lam * (1.0 - lam)
+    alpha_b = l2_normalize(
+        jnn.softmax(semantic_diff_b, axis=-1),
+        axis=-1,
     )
 
-    uncertainty_loss = jnp.mean((uncertainty - target_uncertainty) ** 2)
+    beta_a = uncertain_one + uncertain_mix
+    beta_b = uncertain_b + uncertain_mix
 
-    total_loss = cls_loss + beta * uncertainty_loss
+    info_a = jnp.exp(-(alpha_a + beta_a))
+    info_b = jnp.exp(-(alpha_b + beta_b))
+
+    info_a_y = gather_by_label(info_a, labels_a)
+    info_b_y = gather_by_label(info_b, labels_b)
+
+    lam_a = lam_area * info_a_y
+    lam_b = (1.0 - lam_area) * info_b_y
+
+    lam_sumix = lam_a / (lam_a + lam_b + 1e-8)
+    lam_sumix = jnp.clip(lam_sumix, 0.0, 1.0)
+
+    return lam_sumix, {
+        "alpha_a": alpha_a,
+        "alpha_b": alpha_b,
+        "beta_a": beta_a,
+        "beta_b": beta_b,
+        "info_a": info_a,
+        "info_b": info_b,
+    }
+
+
+def sumix_loss(
+    cls_one,
+    uncertain_one,
+    cls_mix,
+    uncertain_mix,
+    labels_a,
+    labels_b,
+    perm,
+    lam_area,
+    gamma: float = 0.1,
+):
+    """
+    Full SUMix loss.
+
+    total_loss =
+        mixed classification loss using corrected lambda
+        + gamma * uncertainty/semantic regularization
+    """
+
+    lam_sumix, ratio_info = estimate_mixup_ratio(
+        cls_one=cls_one,
+        uncertain_one=uncertain_one,
+        cls_mix=cls_mix,
+        uncertain_mix=uncertain_mix,
+        labels_a=labels_a,
+        labels_b=labels_b,
+        perm=perm,
+        lam_area=lam_area,
+    )
+
+    loss_a = cross_entropy_with_integer_labels(cls_mix, labels_a)
+    loss_b = cross_entropy_with_integer_labels(cls_mix, labels_b)
+
+    cls_loss = jnp.mean(
+        lam_sumix * loss_a + (1.0 - lam_sumix) * loss_b
+    )
+
+    reg_logits_a = -(
+        ratio_info["alpha_a"] + ratio_info["beta_a"]
+    )
+
+    reg_logits_b = -(
+        ratio_info["alpha_b"] + ratio_info["beta_b"]
+    )
+
+    reg_loss_a = cross_entropy_with_integer_labels(
+        reg_logits_a,
+        labels_a,
+    )
+
+    reg_loss_b = cross_entropy_with_integer_labels(
+        reg_logits_b,
+        labels_b,
+    )
+
+    if jnp.ndim(lam_area) == 0:
+        lam_area = jnp.ones_like(lam_sumix) * lam_area
+
+    lam_area = lam_area.reshape(-1)
+
+    reg_loss = jnp.mean(
+        lam_area * reg_loss_a + (1.0 - lam_area) * reg_loss_b
+    )
+
+    total_loss = cls_loss + gamma * reg_loss
 
     return total_loss, {
-        "lam": jnp.mean(lam),
+        "lam": jnp.mean(lam_sumix),
         "cls_loss": cls_loss,
-        "uncertainty_loss": uncertainty_loss,
-        "uncertainty": jnp.mean(uncertainty),
+        "reg_loss": reg_loss,
+        "total_loss": total_loss,
     }

@@ -3,6 +3,8 @@ from typing import Sequence
 import jax.numpy as jnp
 from flax import linen as nn
 
+from cutmix_jax.models.sumix_head import SUMixHead
+
 
 class BasicBlock(nn.Module):
     features: int
@@ -51,10 +53,15 @@ class ResNet(nn.Module):
     stage_sizes: Sequence[int]
     num_classes: int = 10
     base_width: int = 64
+    use_sumix_head: bool = False
 
     @nn.compact
-    def __call__(self, x, train: bool = True):
-        # CIFAR-style ResNet stem: 3x3 conv, no 7x7 conv, no maxpool.
+    def __call__(
+        self,
+        x,
+        train: bool = True,
+        return_features: bool = False,
+    ):
         x = nn.Conv(
             features=self.base_width,
             kernel_size=(3, 3),
@@ -75,18 +82,45 @@ class ResNet(nn.Module):
         for stage_idx, block_count in enumerate(self.stage_sizes):
             for block_idx in range(block_count):
                 stride = 2 if stage_idx > 0 and block_idx == 0 else 1
-
                 x = BasicBlock(
                     features=widths[stage_idx],
                     stride=stride,
                     name=f"stage{stage_idx}_block{block_idx}",
                 )(x, train=train)
 
-        x = jnp.mean(x, axis=(1, 2))
-        x = nn.Dense(self.num_classes)(x)
+        feature_map = x
+        features = jnp.mean(feature_map, axis=(1, 2))
 
-        return x
+        if self.use_sumix_head:
+            cls_logits, uncertain_logits = SUMixHead(
+                num_classes=self.num_classes,
+                name="sumix_head",
+            )(features)
+
+            if return_features:
+                return cls_logits, uncertain_logits, features
+
+            return cls_logits, uncertain_logits
+
+        logits = nn.Dense(
+            self.num_classes,
+            name="classifier",
+        )(features)
+
+        if return_features:
+            return logits, features
+
+        return logits
 
 
-class ResNet18(ResNet):
-    stage_sizes: Sequence[int] = (2, 2, 2, 2)
+def ResNet18(
+    num_classes: int = 10,
+    base_width: int = 64,
+    use_sumix_head: bool = False,
+):
+    return ResNet(
+        stage_sizes=(2, 2, 2, 2),
+        num_classes=num_classes,
+        base_width=base_width,
+        use_sumix_head=use_sumix_head,
+    )
