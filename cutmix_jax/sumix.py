@@ -58,13 +58,14 @@ def estimate_mixup_ratio(
     labels_b,
     perm,
     lam_area,
+    alpha_scale: float = 1.0,
 ):
     """
-    Official-alignment SUMix ratio correction.
+    Official-alignment SUMix ratio correction with tunable alpha scaling.
 
-    This intentionally keeps the official batch-size scaling:
-        alpha_a = l2_norm(softmax(semantic_mix - semantic_one_masked)) * batch_size
-        alpha_b = l2_norm(softmax(semantic_mix - semantic_b_masked)) * batch_size
+    Official SUMix uses alpha_scale = batch_size.
+    Stable JAX adaptation uses alpha_scale = 1.
+    This parameter allows an alpha-scale sweep, e.g. 1, 4, 8, 16, 32, 64, 128.
     """
     batch_size = labels_a.shape[0]
 
@@ -88,12 +89,12 @@ def estimate_mixup_ratio(
     alpha_a = l2_normalize(
         jnn.softmax(semantic_mix - semantic_one_masked, axis=-1),
         axis=-1,
-    ) * batch_size
+    ) * alpha_scale
 
     alpha_b = l2_normalize(
         jnn.softmax(semantic_mix - semantic_b_masked, axis=-1),
         axis=-1,
-    ) * batch_size
+    ) * alpha_scale
 
     uncertain_one = estimate_uncertainty(uncertain_one)
     uncertain_mix = estimate_uncertainty(uncertain_mix)
@@ -136,12 +137,13 @@ def sumix_loss(
     perm,
     lam_area,
     gamma: float = 0.1,
+    alpha_scale: float = 1.0,
 ):
     """
     Official-alignment SUMix loss.
 
     Differences from stable JAX adaptation:
-    - Keeps official alpha * batch_size scaling.
+    - Uses a tunable alpha_scale. Use alpha_scale=batch_size for official-style scaling.
     - Uses official-style scalar CE reduction before lambda weighting.
     - Uses exp(-(alpha + beta)) for the regularization logits/features.
     """
@@ -154,6 +156,7 @@ def sumix_loss(
         labels_b=labels_b,
         perm=perm,
         lam_area=lam_area,
+        alpha_scale=alpha_scale,
     )
 
     if jnp.ndim(lam_area) == 0:

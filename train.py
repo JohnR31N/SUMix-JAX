@@ -68,6 +68,7 @@ def parse_args():
     parser.add_argument("--cutmix-prob", type=float, default=1.0)
 
     parser.add_argument("--sumix-gamma", type=float, default=0.1)
+    parser.add_argument("--sumix-alpha-scale", type=float, default=1.0)
 
     parser.add_argument("--pyramid-depth", type=int, default=20)
     parser.add_argument("--pyramid-alpha", type=int, default=48)
@@ -300,7 +301,7 @@ def train_step_cutmix(state, batch, rng, cutmix_alpha: float):
 
 @partial(
     jax.jit,
-    static_argnames=("cutmix_alpha", "sumix_gamma"),
+    static_argnames=("cutmix_alpha", "sumix_gamma", "sumix_alpha_scale"),
 )
 def train_step_cutmix_sumix(
     state,
@@ -308,6 +309,7 @@ def train_step_cutmix_sumix(
     rng,
     cutmix_alpha: float,
     sumix_gamma: float,
+    sumix_alpha_scale: float,
 ):
     images = jnp.asarray(batch["image"])
     labels = jnp.asarray(batch["label"])
@@ -355,6 +357,7 @@ def train_step_cutmix_sumix(
             perm=info["perm"],
             lam_area=info["lam"],
             gamma=sumix_gamma,
+            alpha_scale=sumix_alpha_scale,
         )
 
         return loss, (cls_mix, new_model_state, sumix_info)
@@ -465,6 +468,7 @@ def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int
                         step_rng,
                         args.cutmix_alpha,
                         args.sumix_gamma,
+                        args.sumix_alpha_scale,
                     )
 
                 train_lams.append(float(metrics["lam"]))
@@ -642,6 +646,7 @@ def create_csv_writer(csv_path):
         "cutmix_alpha",
         "cutmix_prob",
         "sumix_gamma",
+        "sumix_alpha_scale",
     ]
 
     writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -686,6 +691,7 @@ def print_config(args, steps_per_epoch: int, test_steps: int):
 
     if args.aug == "cutmix_sumix":
         print(f"SUMix gamma:        {args.sumix_gamma}")
+        print(f"SUMix alpha scale:  {args.sumix_alpha_scale}")
 
     print(f"Device:             {jax.devices()}")
     print("=" * 80)
@@ -842,6 +848,7 @@ def main():
                     "cutmix_alpha": args.cutmix_alpha,
                     "cutmix_prob": args.cutmix_prob,
                     "sumix_gamma": args.sumix_gamma if args.aug == "cutmix_sumix" else "",
+                    "sumix_alpha_scale": args.sumix_alpha_scale if args.aug == "cutmix_sumix" else "",
                 }
             )
             csv_file.flush()
