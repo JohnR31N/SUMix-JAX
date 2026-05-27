@@ -19,15 +19,27 @@ def gather_by_label(values, labels):
     return values[batch_indices, labels]
 
 
+def zero_out_label(prob, labels):
+    """
+    Official-style semantic masking.
+
+    For each sample i:
+        prob[i, labels[i]] = 0
+
+    This matches the idea in official SUMix:
+        semantic_one[i, y_b[i]] = 0
+        semantic_one_[i, y_a[i]] = 0
+    """
+    batch_indices = jnp.arange(labels.shape[0])
+    return prob.at[batch_indices, labels].set(0.0)
+
+
 def estimate_uncertainty(uncertain_logits):
     """
     Uncertainty estimation module.
 
-    Input:
-        uncertain_logits: [B, num_classes]
-
-    Output:
-        normalized uncertainty distribution: [B, num_classes]
+    Official-style:
+        softmax -> l2_norm
     """
     uncertain_prob = jnn.softmax(uncertain_logits, axis=-1)
     uncertain_prob = l2_normalize(uncertain_prob, axis=-1)
@@ -38,15 +50,8 @@ def estimate_uncertainty(uncertain_logits):
 def estimate_semantic_information(cls_logits):
     """
     Semantic information from classifier logits.
-
-    Input:
-        cls_logits: [B, num_classes]
-
-    Output:
-        semantic probability distribution: [B, num_classes]
     """
     semantic_prob = jnn.softmax(cls_logits, axis=-1)
-
     return semantic_prob
 
 
@@ -61,28 +66,29 @@ def estimate_mixup_ratio(
     lam_area,
 ):
     """
-    SUMix mixup ratio learning / correction.
+    Official-style SUMix mixup ratio correction.
 
-    cls_one:
-        classifier logits for original images x_a
+    This follows the key logic of official IN_loss:
 
-    uncertain_one:
-        uncertainty logits for original images x_a
+        semantic_one  = softmax(cls_one.detach())
+        semantic_mix  = softmax(cls_mix.detach())
+        semantic_b    = semantic_one[rand_index]
 
-    cls_mix:
-        classifier logits for mixed images
+        semantic_one[i, y_b[i]] = 0
+        semantic_b[i, y_a[i]] = 0
 
-    uncertain_mix:
-        uncertainty logits for mixed images
+        alpha_a = l2_norm(softmax(semantic_mix - semantic_one)) * batch_size
+        alpha_b = l2_norm(softmax(semantic_mix - semantic_b)) * batch_size
 
-    labels_a, labels_b:
-        original labels and shuffled labels
+        INa = exp(-alpha_a)
+        INb = exp(-alpha_b)
 
-    perm:
-        shuffle index from CutMix
+        lam_a = lam * INa[y_a]
+        lam_b = (1 - lam) * INb[y_b]
+        lam_sumix = lam_a / (lam_a + lam_b)
 
-    lam_area:
-        CutMix area lambda
+    beta / uncertainty is returned for regularization, not used directly
+    in lambda correction.
     """
 
     batch_size = labels_a.shape[0]
@@ -100,29 +106,32 @@ def estimate_mixup_ratio(
 
     semantic_b = semantic_one[perm]
 
-    uncertain_one = estimate_uncertainty(uncertain_one)
-    uncertain_mix = estimate_uncertainty(uncertain_mix)
-
-    uncertain_b = uncertain_one[perm]
-
-    semantic_diff_a = semantic_mix - semantic_one
-    semantic_diff_b = semantic_mix - semantic_b
+    # Official detail:
+    # semantic_one[i, y_b[i]] = 0
+    # semantic_b[i, y_a[i]] = 0
+    semantic_one_masked = zero_out_label(semantic_one, labels_b)
+    semantic_b_masked = zero_out_label(semantic_b, labels_a)
 
     alpha_a = l2_normalize(
-        jnn.softmax(semantic_diff_a, axis=-1),
+        jnn.softmax(semantic_mix - semantic_one_masked, axis=-1),
         axis=-1,
-    )
+    ) * batch_size
 
     alpha_b = l2_normalize(
-        jnn.softmax(semantic_diff_b, axis=-1),
+        jnn.softmax(semantic_mix - semantic_b_masked, axis=-1),
         axis=-1,
-    )
+    ) * batch_size
+
+    uncertain_one = estimate_uncertainty(uncertain_one)
+    uncertain_mix = estimate_uncertainty(uncertain_mix)
+    uncertain_b = uncertain_one[perm]
 
     beta_a = uncertain_one + uncertain_mix
     beta_b = uncertain_b + uncertain_mix
 
-    info_a = jnp.exp(-(alpha_a + beta_a))
-    info_b = jnp.exp(-(alpha_b + beta_b))
+    # Official-style lambda correction uses semantic information only.
+    info_a = jnp.exp(-alpha_a)
+    info_b = jnp.exp(-alpha_b)
 
     info_a_y = gather_by_label(info_a, labels_a)
     info_b_y = gather_by_label(info_b, labels_b)
@@ -155,10 +164,10 @@ def sumix_loss(
     gamma: float = 0.1,
 ):
     """
-    Full SUMix loss.
+    Official-style SUMix loss.
 
     total_loss =
-        mixed classification loss using corrected lambda
+        corrected-lambda mixed classification loss
         + gamma * uncertainty/semantic regularization
     """
 
@@ -180,6 +189,9 @@ def sumix_loss(
         lam_sumix * loss_a + (1.0 - lam_sumix) * loss_b
     )
 
+    # Official-style regularization:
+    # INa_f = exp(-(beta + alpha))
+    # INb_f = exp(-(beta_ + alpha_))
     reg_logits_a = -(
         ratio_info["alpha_a"] + ratio_info["beta_a"]
     )
