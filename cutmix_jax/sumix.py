@@ -26,7 +26,7 @@ def zero_out_label(prob, labels):
     For each sample i:
         prob[i, labels[i]] = 0
 
-    This matches the idea in official SUMix:
+    Matches official SUMix:
         semantic_one[i, y_b[i]] = 0
         semantic_one_[i, y_a[i]] = 0
     """
@@ -36,9 +36,7 @@ def zero_out_label(prob, labels):
 
 def estimate_uncertainty(uncertain_logits):
     """
-    Uncertainty estimation module.
-
-    Official-style:
+    Official uncertainty branch:
         softmax -> l2_norm
     """
     uncertain_prob = jnn.softmax(uncertain_logits, axis=-1)
@@ -47,11 +45,8 @@ def estimate_uncertainty(uncertain_logits):
 
 
 def estimate_semantic_information(cls_logits):
-    """
-    Semantic information from classifier logits.
-    """
-    semantic_prob = jnn.softmax(cls_logits, axis=-1)
-    return semantic_prob
+    """Semantic information from classifier logits."""
+    return jnn.softmax(cls_logits, axis=-1)
 
 
 def estimate_mixup_ratio(
@@ -65,42 +60,23 @@ def estimate_mixup_ratio(
     lam_area,
 ):
     """
-    SUMix mixup ratio correction.
+    Official-alignment SUMix ratio correction.
 
-    This follows the official-style semantic correction logic, but removes
-    batch-size scaling from alpha for numerical stability in this JAX version.
-
-        semantic_one  = softmax(cls_one.detach())
-        semantic_mix  = softmax(cls_mix.detach())
-        semantic_b    = semantic_one[rand_index]
-
-        semantic_one[i, y_b[i]] = 0
-        semantic_b[i, y_a[i]] = 0
-
-        alpha_a = l2_norm(softmax(semantic_mix - semantic_one))
-        alpha_b = l2_norm(softmax(semantic_mix - semantic_b))
-
-        INa = exp(-alpha_a)
-        INb = exp(-alpha_b)
-
-        lam_a = lam * INa[y_a]
-        lam_b = (1 - lam) * INb[y_b]
-        lam_sumix = lam_a / (lam_a + lam_b)
-
-    beta / uncertainty is returned for regularization, not used directly
-    in lambda correction.
+    This intentionally keeps the official batch-size scaling:
+        alpha_a = l2_norm(softmax(semantic_mix - semantic_one_masked)) * batch_size
+        alpha_b = l2_norm(softmax(semantic_mix - semantic_b_masked)) * batch_size
     """
-
     batch_size = labels_a.shape[0]
 
     if jnp.ndim(lam_area) == 0:
         lam_area = jnp.ones((batch_size,), dtype=cls_mix.dtype) * lam_area
-
     lam_area = lam_area.reshape(-1)
 
     semantic_one = estimate_semantic_information(cls_one)
     semantic_mix = estimate_semantic_information(cls_mix)
 
+    # Official uses cls_one.clone().detach() and cls_mix.clone().detach()
+    # before estimating semantic information.
     semantic_one = jax.lax.stop_gradient(semantic_one)
     semantic_mix = jax.lax.stop_gradient(semantic_mix)
 
@@ -112,12 +88,12 @@ def estimate_mixup_ratio(
     alpha_a = l2_normalize(
         jnn.softmax(semantic_mix - semantic_one_masked, axis=-1),
         axis=-1,
-    )
+    ) * batch_size
 
     alpha_b = l2_normalize(
         jnn.softmax(semantic_mix - semantic_b_masked, axis=-1),
         axis=-1,
-    )
+    ) * batch_size
 
     uncertain_one = estimate_uncertainty(uncertain_one)
     uncertain_mix = estimate_uncertainty(uncertain_mix)
@@ -135,7 +111,9 @@ def estimate_mixup_ratio(
     lam_a = lam_area * info_a_y
     lam_b = (1.0 - lam_area) * info_b_y
 
-    lam_sumix = lam_a / (lam_a + lam_b + 1e-8)
+    # Official code does not add epsilon, but JAX/TPU can underflow to zero here.
+    # A tiny epsilon prevents NaNs while preserving the official form for diagnostics.
+    lam_sumix = lam_a / (lam_a + lam_b + 1e-12)
     lam_sumix = jnp.clip(lam_sumix, 0.0, 1.0)
 
     return lam_sumix, {
@@ -160,13 +138,13 @@ def sumix_loss(
     gamma: float = 0.1,
 ):
     """
-    SUMix loss.
+    Official-alignment SUMix loss.
 
-    total_loss =
-        corrected-lambda mixed classification loss
-        + gamma * uncertainty/semantic regularization
+    Differences from stable JAX adaptation:
+    - Keeps official alpha * batch_size scaling.
+    - Uses official-style scalar CE reduction before lambda weighting.
+    - Uses exp(-(alpha + beta)) for the regularization logits/features.
     """
-
     lam_sumix, ratio_info = estimate_mixup_ratio(
         cls_one=cls_one,
         uncertain_one=uncertain_one,
@@ -178,38 +156,31 @@ def sumix_loss(
         lam_area=lam_area,
     )
 
-    loss_a = cross_entropy_with_integer_labels(cls_mix, labels_a)
-    loss_b = cross_entropy_with_integer_labels(cls_mix, labels_b)
-
-    cls_loss = jnp.mean(
-        lam_sumix * loss_a + (1.0 - lam_sumix) * loss_b
-    )
-
-    reg_logits_a = -(
-        ratio_info["alpha_a"] + ratio_info["beta_a"]
-    )
-
-    reg_logits_b = -(
-        ratio_info["alpha_b"] + ratio_info["beta_b"]
-    )
-
-    reg_loss_a = cross_entropy_with_integer_labels(
-        reg_logits_a,
-        labels_a,
-    )
-
-    reg_loss_b = cross_entropy_with_integer_labels(
-        reg_logits_b,
-        labels_b,
-    )
-
     if jnp.ndim(lam_area) == 0:
         lam_area = jnp.ones_like(lam_sumix) * lam_area
-
     lam_area = lam_area.reshape(-1)
 
+    # Official-style scalar CE reduction before lambda weighting.
+    ce_a_scalar = jnp.mean(cross_entropy_with_integer_labels(cls_mix, labels_a))
+    ce_b_scalar = jnp.mean(cross_entropy_with_integer_labels(cls_mix, labels_b))
+
+    cls_loss = jnp.mean(
+        ce_a_scalar * lam_sumix + ce_b_scalar * (1.0 - lam_sumix)
+    )
+
+    # Official regularization path: INa_f = exp(-(beta + alpha)).
+    reg_logits_a = jnp.exp(-(
+        ratio_info["alpha_a"] + ratio_info["beta_a"]
+    ))
+    reg_logits_b = jnp.exp(-(
+        ratio_info["alpha_b"] + ratio_info["beta_b"]
+    ))
+
+    reg_ce_a_scalar = jnp.mean(cross_entropy_with_integer_labels(reg_logits_a, labels_a))
+    reg_ce_b_scalar = jnp.mean(cross_entropy_with_integer_labels(reg_logits_b, labels_b))
+
     reg_loss = jnp.mean(
-        lam_area * reg_loss_a + (1.0 - lam_area) * reg_loss_b
+        reg_ce_a_scalar * lam_area + reg_ce_b_scalar * (1.0 - lam_area)
     )
 
     total_loss = cls_loss + gamma * reg_loss
@@ -222,6 +193,8 @@ def sumix_loss(
         "cls_loss": cls_loss,
         "reg_loss": reg_loss,
         "total_loss": total_loss,
+        "alpha_a_y_mean": jnp.mean(gather_by_label(ratio_info["alpha_a"], labels_a)),
+        "alpha_b_y_mean": jnp.mean(gather_by_label(ratio_info["alpha_b"], labels_b)),
         "info_a_y_mean": jnp.mean(gather_by_label(ratio_info["info_a"], labels_a)),
         "info_b_y_mean": jnp.mean(gather_by_label(ratio_info["info_b"], labels_b)),
     }

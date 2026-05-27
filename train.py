@@ -325,12 +325,16 @@ def train_step_cutmix_sumix(
             "batch_stats": state.batch_stats,
         }
 
-        cls_one, uncertain_one = state.apply_fn(
+        # Official-alignment: keep the original-image forward in train mode.
+        # This matches the PyTorch/OpenMixup training path more closely than
+        # using eval-mode BatchNorm for the original image branch.
+        outputs_one, _ = state.apply_fn(
             variables,
             images,
-            train=False,
-            mutable=False,
+            train=True,
+            mutable=["batch_stats"],
         )
+        cls_one, uncertain_one = outputs_one
 
         outputs_mix, new_model_state = state.apply_fn(
             variables,
@@ -374,6 +378,8 @@ def train_step_cutmix_sumix(
         "lam_std": sumix_info["lam_std"],
         "cls_loss": sumix_info["cls_loss"],
         "reg_loss": sumix_info["reg_loss"],
+        "alpha_a_y_mean": sumix_info["alpha_a_y_mean"],
+        "alpha_b_y_mean": sumix_info["alpha_b_y_mean"],
         "info_a_y_mean": sumix_info["info_a_y_mean"],
         "info_b_y_mean": sumix_info["info_b_y_mean"],
     }
@@ -418,6 +424,8 @@ def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int
     train_lam_stds = []
     train_cls_losses = []
     train_reg_losses = []
+    train_alpha_a_y_means = []
+    train_alpha_b_y_means = []
     train_info_a_y_means = []
     train_info_b_y_means = []
 
@@ -476,6 +484,8 @@ def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int
             train_lam_stds.append(float(metrics["lam_std"]))
             train_cls_losses.append(float(metrics["cls_loss"]))
             train_reg_losses.append(float(metrics["reg_loss"]))
+            train_alpha_a_y_means.append(float(metrics["alpha_a_y_mean"]))
+            train_alpha_b_y_means.append(float(metrics["alpha_b_y_mean"]))
             train_info_a_y_means.append(float(metrics["info_a_y_mean"]))
             train_info_b_y_means.append(float(metrics["info_b_y_mean"]))
 
@@ -493,6 +503,7 @@ def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int
         if train_reg_losses:
             postfix["reg"] = f"{sum(train_reg_losses) / len(train_reg_losses):.4f}"
             postfix["lstd"] = f"{sum(train_lam_stds) / len(train_lam_stds):.4f}"
+            postfix["alpha"] = f"{sum(train_alpha_a_y_means) / len(train_alpha_a_y_means):.2f}"
 
         if args.aug in ["cutmix", "cutmix_sumix"]:
             postfix["mix"] = f"{cutmix_count / total_count:.3f}"
@@ -508,6 +519,16 @@ def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int
         "lam_std": sum(train_lam_stds) / len(train_lam_stds) if train_lam_stds else None,
         "cls_loss": sum(train_cls_losses) / len(train_cls_losses) if train_cls_losses else None,
         "reg_loss": sum(train_reg_losses) / len(train_reg_losses) if train_reg_losses else None,
+        "alpha_a_y_mean": (
+            sum(train_alpha_a_y_means) / len(train_alpha_a_y_means)
+            if train_alpha_a_y_means
+            else None
+        ),
+        "alpha_b_y_mean": (
+            sum(train_alpha_b_y_means) / len(train_alpha_b_y_means)
+            if train_alpha_b_y_means
+            else None
+        ),
         "info_a_y_mean": (
             sum(train_info_a_y_means) / len(train_info_a_y_means)
             if train_info_a_y_means
@@ -602,6 +623,8 @@ def create_csv_writer(csv_path):
         "lam_std",
         "cls_loss",
         "reg_loss",
+        "alpha_a_y_mean",
+        "alpha_b_y_mean",
         "info_a_y_mean",
         "info_b_y_mean",
         "cutmix_rate",
@@ -742,6 +765,8 @@ def main():
             lam_std = train_metrics["lam_std"]
             cls_loss = train_metrics["cls_loss"]
             reg_loss = train_metrics["reg_loss"]
+            alpha_a_y_mean = train_metrics["alpha_a_y_mean"]
+            alpha_b_y_mean = train_metrics["alpha_b_y_mean"]
             info_a_y_mean = train_metrics["info_a_y_mean"]
             info_b_y_mean = train_metrics["info_b_y_mean"]
             cutmix_rate = train_metrics["cutmix_rate"]
@@ -764,6 +789,8 @@ def main():
                     f" | lam std {lam_std:.4f}"
                     f" | cls {cls_loss:.4f}"
                     f" | reg {reg_loss:.4f}"
+                    f" | alpha_a {alpha_a_y_mean:.4f}"
+                    f" | alpha_b {alpha_b_y_mean:.4f}"
                     f" | info_a {info_a_y_mean:.4e}"
                     f" | info_b {info_b_y_mean:.4e}"
                 )
@@ -796,6 +823,8 @@ def main():
                     "lam_std": "" if lam_std is None else lam_std,
                     "cls_loss": "" if cls_loss is None else cls_loss,
                     "reg_loss": "" if reg_loss is None else reg_loss,
+                    "alpha_a_y_mean": "" if alpha_a_y_mean is None else alpha_a_y_mean,
+                    "alpha_b_y_mean": "" if alpha_b_y_mean is None else alpha_b_y_mean,
                     "info_a_y_mean": "" if info_a_y_mean is None else info_a_y_mean,
                     "info_b_y_mean": "" if info_b_y_mean is None else info_b_y_mean,
                     "cutmix_rate": cutmix_rate,
