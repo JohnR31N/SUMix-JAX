@@ -369,8 +369,13 @@ def train_step_cutmix_sumix(
         "loss": loss,
         "acc": acc,
         "lam": sumix_info["lam"],
+        "lam_min": sumix_info["lam_min"],
+        "lam_max": sumix_info["lam_max"],
+        "lam_std": sumix_info["lam_std"],
         "cls_loss": sumix_info["cls_loss"],
         "reg_loss": sumix_info["reg_loss"],
+        "info_a_y_mean": sumix_info["info_a_y_mean"],
+        "info_b_y_mean": sumix_info["info_b_y_mean"],
     }
 
 
@@ -406,6 +411,15 @@ def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int
     train_losses = []
     train_accs = []
     train_lams = []
+
+    # SUMix diagnostic metrics.
+    train_lam_mins = []
+    train_lam_maxs = []
+    train_lam_stds = []
+    train_cls_losses = []
+    train_reg_losses = []
+    train_info_a_y_means = []
+    train_info_b_y_means = []
 
     cutmix_count = 0
     total_count = 0
@@ -456,6 +470,15 @@ def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int
         loss = float(metrics["loss"])
         acc = float(metrics["acc"])
 
+        if args.aug == "cutmix_sumix" and "cls_loss" in metrics:
+            train_lam_mins.append(float(metrics["lam_min"]))
+            train_lam_maxs.append(float(metrics["lam_max"]))
+            train_lam_stds.append(float(metrics["lam_std"]))
+            train_cls_losses.append(float(metrics["cls_loss"]))
+            train_reg_losses.append(float(metrics["reg_loss"]))
+            train_info_a_y_means.append(float(metrics["info_a_y_mean"]))
+            train_info_b_y_means.append(float(metrics["info_b_y_mean"]))
+
         train_losses.append(loss)
         train_accs.append(acc)
 
@@ -467,6 +490,10 @@ def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int
         if train_lams:
             postfix["lam"] = f"{sum(train_lams) / len(train_lams):.4f}"
 
+        if train_reg_losses:
+            postfix["reg"] = f"{sum(train_reg_losses) / len(train_reg_losses):.4f}"
+            postfix["lstd"] = f"{sum(train_lam_stds) / len(train_lam_stds):.4f}"
+
         if args.aug in ["cutmix", "cutmix_sumix"]:
             postfix["mix"] = f"{cutmix_count / total_count:.3f}"
 
@@ -476,6 +503,21 @@ def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int
         "loss": sum(train_losses) / len(train_losses),
         "acc": sum(train_accs) / len(train_accs),
         "lam": sum(train_lams) / len(train_lams) if train_lams else None,
+        "lam_min": sum(train_lam_mins) / len(train_lam_mins) if train_lam_mins else None,
+        "lam_max": sum(train_lam_maxs) / len(train_lam_maxs) if train_lam_maxs else None,
+        "lam_std": sum(train_lam_stds) / len(train_lam_stds) if train_lam_stds else None,
+        "cls_loss": sum(train_cls_losses) / len(train_cls_losses) if train_cls_losses else None,
+        "reg_loss": sum(train_reg_losses) / len(train_reg_losses) if train_reg_losses else None,
+        "info_a_y_mean": (
+            sum(train_info_a_y_means) / len(train_info_a_y_means)
+            if train_info_a_y_means
+            else None
+        ),
+        "info_b_y_mean": (
+            sum(train_info_b_y_means) / len(train_info_b_y_means)
+            if train_info_b_y_means
+            else None
+        ),
         "cutmix_rate": cutmix_count / total_count
         if args.aug in ["cutmix", "cutmix_sumix"]
         else 0.0,
@@ -555,6 +597,13 @@ def create_csv_writer(csv_path):
         "test_error",
         "best_test_acc",
         "avg_lam",
+        "lam_min",
+        "lam_max",
+        "lam_std",
+        "cls_loss",
+        "reg_loss",
+        "info_a_y_mean",
+        "info_b_y_mean",
         "cutmix_rate",
         "epoch_time_sec",
         "total_time_sec",
@@ -688,6 +737,13 @@ def main():
             best_test_acc = max(best_test_acc, test_acc)
 
             avg_lam = train_metrics["lam"]
+            lam_min = train_metrics["lam_min"]
+            lam_max = train_metrics["lam_max"]
+            lam_std = train_metrics["lam_std"]
+            cls_loss = train_metrics["cls_loss"]
+            reg_loss = train_metrics["reg_loss"]
+            info_a_y_mean = train_metrics["info_a_y_mean"]
+            info_b_y_mean = train_metrics["info_b_y_mean"]
             cutmix_rate = train_metrics["cutmix_rate"]
 
             msg = (
@@ -702,6 +758,15 @@ def main():
 
             if avg_lam is not None:
                 msg += f" | avg lam {avg_lam:.4f}"
+
+            if args.aug == "cutmix_sumix" and reg_loss is not None:
+                msg += (
+                    f" | lam std {lam_std:.4f}"
+                    f" | cls {cls_loss:.4f}"
+                    f" | reg {reg_loss:.4f}"
+                    f" | info_a {info_a_y_mean:.4e}"
+                    f" | info_b {info_b_y_mean:.4e}"
+                )
 
             if args.aug in ["cutmix", "cutmix_sumix"]:
                 msg += f" | mix rate {cutmix_rate:.4f}"
@@ -726,6 +791,13 @@ def main():
                     "test_error": test_error,
                     "best_test_acc": best_test_acc,
                     "avg_lam": "" if avg_lam is None else avg_lam,
+                    "lam_min": "" if lam_min is None else lam_min,
+                    "lam_max": "" if lam_max is None else lam_max,
+                    "lam_std": "" if lam_std is None else lam_std,
+                    "cls_loss": "" if cls_loss is None else cls_loss,
+                    "reg_loss": "" if reg_loss is None else reg_loss,
+                    "info_a_y_mean": "" if info_a_y_mean is None else info_a_y_mean,
+                    "info_b_y_mean": "" if info_b_y_mean is None else info_b_y_mean,
                     "cutmix_rate": cutmix_rate,
                     "epoch_time_sec": epoch_time,
                     "total_time_sec": total_time,

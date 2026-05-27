@@ -223,7 +223,12 @@ def sumix_loss(
 
     return total_loss, {
         "lam": jnp.mean(lam_sumix),
+        "lam_min": jnp.min(lam_sumix),
+        "lam_max": jnp.max(lam_sumix),
+        "lam_std": jnp.std(lam_sumix),
         "cls_loss": cls_loss,
         "reg_loss": reg_loss,
         "total_loss": total_loss,
+        "info_a_y_mean": jnp.mean(gather_by_label(ratio_info["info_a"], labels_a)),
+        "info_b_y_mean": jnp.mean(gather_by_label(ratio_info["info_b"], labels_b)),
     }
