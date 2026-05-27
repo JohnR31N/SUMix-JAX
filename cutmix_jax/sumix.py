@@ -115,12 +115,12 @@ def estimate_mixup_ratio(
     alpha_a = l2_normalize(
         jnn.softmax(semantic_mix - semantic_one_masked, axis=-1),
         axis=-1,
-    ) * batch_size
+    ) 
 
     alpha_b = l2_normalize(
         jnn.softmax(semantic_mix - semantic_b_masked, axis=-1),
         axis=-1,
-    ) * batch_size
+    ) 
 
     uncertain_one = estimate_uncertainty(uncertain_one)
     uncertain_mix = estimate_uncertainty(uncertain_mix)
