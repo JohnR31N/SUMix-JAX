@@ -8,7 +8,9 @@ from typing import Any, Dict
 import jax
 import jax.numpy as jnp
 import optax
+from flax import jax_utils
 from flax.training import train_state
+from flax.training.common_utils import shard
 from tqdm import tqdm
 
 from cutmix_jax.datasets import get_cifar10_dataset, numpy_iterator
@@ -69,6 +71,10 @@ def parse_args():
 
     parser.add_argument("--sumix-gamma", type=float, default=0.1)
     parser.add_argument("--sumix-alpha-scale", type=float, default=1.0)
+
+    # Use multi-device data parallel training via jax.pmap.
+    # Keep --batch-size as the GLOBAL batch size; it must be divisible by local_device_count.
+    parser.add_argument("--use-pmap", action="store_true")
 
     parser.add_argument("--pyramid-depth", type=int, default=20)
     parser.add_argument("--pyramid-alpha", type=int, default=48)
@@ -388,6 +394,213 @@ def train_step_cutmix_sumix(
     }
 
 
+@partial(jax.pmap, axis_name="batch")
+def train_step_baseline_pmap(state, batch):
+    images = jnp.asarray(batch["image"])
+    labels = jnp.asarray(batch["label"])
+
+    def loss_fn(params):
+        variables = {
+            "params": params,
+            "batch_stats": state.batch_stats,
+        }
+
+        outputs, new_model_state = state.apply_fn(
+            variables,
+            images,
+            train=True,
+            mutable=["batch_stats"],
+        )
+
+        logits = get_logits(outputs)
+        loss = classification_loss(logits, labels)
+
+        return loss, (logits, new_model_state)
+
+    (loss, (logits, new_model_state)), grads = jax.value_and_grad(
+        loss_fn,
+        has_aux=True,
+    )(state.params)
+
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    loss = jax.lax.pmean(loss, axis_name="batch")
+
+    # Keep replicated BatchNorm running statistics synchronized across devices.
+    new_batch_stats = jax.lax.pmean(new_model_state["batch_stats"], axis_name="batch")
+
+    state = state.apply_gradients(grads=grads)
+    state = state.replace(batch_stats=new_batch_stats)
+
+    acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
+    acc = jax.lax.pmean(acc, axis_name="batch")
+
+    return state, {
+        "loss": loss,
+        "acc": acc,
+    }
+
+
+@partial(
+    jax.pmap,
+    axis_name="batch",
+    static_broadcasted_argnums=(3,),
+)
+def train_step_cutmix_pmap(state, batch, rng, cutmix_alpha: float):
+    images = jnp.asarray(batch["image"])
+    labels = jnp.asarray(batch["label"])
+
+    mixed_images, info = cutmix_batch(
+        images=images,
+        labels=labels,
+        rng=rng,
+        alpha=cutmix_alpha,
+    )
+
+    def loss_fn(params):
+        variables = {
+            "params": params,
+            "batch_stats": state.batch_stats,
+        }
+
+        outputs, new_model_state = state.apply_fn(
+            variables,
+            mixed_images,
+            train=True,
+            mutable=["batch_stats"],
+        )
+
+        logits = get_logits(outputs)
+        loss = cutmix_loss(logits, info)
+
+        return loss, (logits, new_model_state)
+
+    (loss, (logits, new_model_state)), grads = jax.value_and_grad(
+        loss_fn,
+        has_aux=True,
+    )(state.params)
+
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    loss = jax.lax.pmean(loss, axis_name="batch")
+    new_batch_stats = jax.lax.pmean(new_model_state["batch_stats"], axis_name="batch")
+
+    state = state.apply_gradients(grads=grads)
+    state = state.replace(batch_stats=new_batch_stats)
+
+    acc = jnp.mean(jnp.argmax(logits, axis=-1) == info["labels_a"])
+    acc = jax.lax.pmean(acc, axis_name="batch")
+    lam = jax.lax.pmean(info["lam"], axis_name="batch")
+
+    return state, {
+        "loss": loss,
+        "acc": acc,
+        "lam": lam,
+    }
+
+
+@partial(
+    jax.pmap,
+    axis_name="batch",
+    static_broadcasted_argnums=(3, 4, 5),
+)
+def train_step_cutmix_sumix_pmap(
+    state,
+    batch,
+    rng,
+    cutmix_alpha: float,
+    sumix_gamma: float,
+    sumix_alpha_scale: float,
+):
+    images = jnp.asarray(batch["image"])
+    labels = jnp.asarray(batch["label"])
+
+    mixed_images, info = cutmix_batch(
+        images=images,
+        labels=labels,
+        rng=rng,
+        alpha=cutmix_alpha,
+    )
+
+    def loss_fn(params):
+        variables = {
+            "params": params,
+            "batch_stats": state.batch_stats,
+        }
+
+        # Official-alignment: original and mixed branches both use train=True.
+        # Semantic probabilities are detached inside cutmix_jax.sumix.sumix_loss.
+        outputs_one, _ = state.apply_fn(
+            variables,
+            images,
+            train=True,
+            mutable=["batch_stats"],
+        )
+        cls_one, uncertain_one = outputs_one
+
+        outputs_mix, new_model_state = state.apply_fn(
+            variables,
+            mixed_images,
+            train=True,
+            mutable=["batch_stats"],
+        )
+        cls_mix, uncertain_mix = outputs_mix
+
+        loss, sumix_info = sumix_loss(
+            cls_one=cls_one,
+            uncertain_one=uncertain_one,
+            cls_mix=cls_mix,
+            uncertain_mix=uncertain_mix,
+            labels_a=info["labels_a"],
+            labels_b=info["labels_b"],
+            perm=info["perm"],
+            lam_area=info["lam"],
+            gamma=sumix_gamma,
+            alpha_scale=sumix_alpha_scale,
+        )
+
+        return loss, (cls_mix, new_model_state, sumix_info)
+
+    (loss, (logits, new_model_state, sumix_info)), grads = jax.value_and_grad(
+        loss_fn,
+        has_aux=True,
+    )(state.params)
+
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    loss = jax.lax.pmean(loss, axis_name="batch")
+    new_batch_stats = jax.lax.pmean(new_model_state["batch_stats"], axis_name="batch")
+
+    state = state.apply_gradients(grads=grads)
+    state = state.replace(batch_stats=new_batch_stats)
+
+    acc = jnp.mean(jnp.argmax(logits, axis=-1) == info["labels_a"])
+
+    metrics = {
+        "loss": loss,
+        "acc": acc,
+        "lam": sumix_info["lam"],
+        "lam_min": sumix_info["lam_min"],
+        "lam_max": sumix_info["lam_max"],
+        "lam_std": sumix_info["lam_std"],
+        "cls_loss": sumix_info["cls_loss"],
+        "reg_loss": sumix_info["reg_loss"],
+        "alpha_a_y_mean": sumix_info["alpha_a_y_mean"],
+        "alpha_b_y_mean": sumix_info["alpha_b_y_mean"],
+        "info_a_y_mean": sumix_info["info_a_y_mean"],
+        "info_b_y_mean": sumix_info["info_b_y_mean"],
+    }
+
+    metrics = jax.lax.pmean(metrics, axis_name="batch")
+
+    return state, metrics
+
+
+def metric_to_float(metrics, key: str) -> float:
+    """Convert scalar metric from either jit or pmap output to Python float."""
+    value = jax.device_get(metrics[key])
+    if hasattr(value, "shape") and value.shape != ():
+        return float(value[0])
+    return float(value)
+
+
 @jax.jit
 def eval_step(state, batch):
     images = jnp.asarray(batch["image"])
@@ -443,55 +656,91 @@ def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int
         leave=True,
     )
 
+    n_devices = jax.local_device_count()
+
     for batch in train_iter:
         rng, step_rng, prob_rng = jax.random.split(rng, 3)
         total_count += 1
 
+        step_batch = batch
+        step_rng_arg = step_rng
+
+        if args.use_pmap:
+            # pmap expects a leading device axis:
+            #   image: (global_batch, H, W, C) -> (n_devices, per_device_batch, H, W, C)
+            #   label: (global_batch,)       -> (n_devices, per_device_batch)
+            step_batch = shard(batch)
+            step_rng_arg = jax.random.split(step_rng, n_devices)
+
         if args.aug == "none":
-            state, metrics = train_step_baseline(state, batch)
+            if args.use_pmap:
+                state, metrics = train_step_baseline_pmap(state, step_batch)
+            else:
+                state, metrics = train_step_baseline(state, step_batch)
 
         elif args.aug in ["cutmix", "cutmix_sumix"]:
             use_mix = bool(jax.random.uniform(prob_rng) < args.cutmix_prob)
 
             if use_mix:
                 if args.aug == "cutmix":
-                    state, metrics = train_step_cutmix(
-                        state,
-                        batch,
-                        step_rng,
-                        args.cutmix_alpha,
-                    )
+                    if args.use_pmap:
+                        state, metrics = train_step_cutmix_pmap(
+                            state,
+                            step_batch,
+                            step_rng_arg,
+                            args.cutmix_alpha,
+                        )
+                    else:
+                        state, metrics = train_step_cutmix(
+                            state,
+                            step_batch,
+                            step_rng_arg,
+                            args.cutmix_alpha,
+                        )
                 else:
-                    state, metrics = train_step_cutmix_sumix(
-                        state,
-                        batch,
-                        step_rng,
-                        args.cutmix_alpha,
-                        args.sumix_gamma,
-                        args.sumix_alpha_scale,
-                    )
+                    if args.use_pmap:
+                        state, metrics = train_step_cutmix_sumix_pmap(
+                            state,
+                            step_batch,
+                            step_rng_arg,
+                            args.cutmix_alpha,
+                            args.sumix_gamma,
+                            args.sumix_alpha_scale,
+                        )
+                    else:
+                        state, metrics = train_step_cutmix_sumix(
+                            state,
+                            step_batch,
+                            step_rng_arg,
+                            args.cutmix_alpha,
+                            args.sumix_gamma,
+                            args.sumix_alpha_scale,
+                        )
 
-                train_lams.append(float(metrics["lam"]))
+                train_lams.append(metric_to_float(metrics, "lam"))
                 cutmix_count += 1
             else:
-                state, metrics = train_step_baseline(state, batch)
+                if args.use_pmap:
+                    state, metrics = train_step_baseline_pmap(state, step_batch)
+                else:
+                    state, metrics = train_step_baseline(state, step_batch)
 
         else:
             raise ValueError(f"Unsupported augmentation: {args.aug}")
 
-        loss = float(metrics["loss"])
-        acc = float(metrics["acc"])
+        loss = metric_to_float(metrics, "loss")
+        acc = metric_to_float(metrics, "acc")
 
         if args.aug == "cutmix_sumix" and "cls_loss" in metrics:
-            train_lam_mins.append(float(metrics["lam_min"]))
-            train_lam_maxs.append(float(metrics["lam_max"]))
-            train_lam_stds.append(float(metrics["lam_std"]))
-            train_cls_losses.append(float(metrics["cls_loss"]))
-            train_reg_losses.append(float(metrics["reg_loss"]))
-            train_alpha_a_y_means.append(float(metrics["alpha_a_y_mean"]))
-            train_alpha_b_y_means.append(float(metrics["alpha_b_y_mean"]))
-            train_info_a_y_means.append(float(metrics["info_a_y_mean"]))
-            train_info_b_y_means.append(float(metrics["info_b_y_mean"]))
+            train_lam_mins.append(metric_to_float(metrics, "lam_min"))
+            train_lam_maxs.append(metric_to_float(metrics, "lam_max"))
+            train_lam_stds.append(metric_to_float(metrics, "lam_std"))
+            train_cls_losses.append(metric_to_float(metrics, "cls_loss"))
+            train_reg_losses.append(metric_to_float(metrics, "reg_loss"))
+            train_alpha_a_y_means.append(metric_to_float(metrics, "alpha_a_y_mean"))
+            train_alpha_b_y_means.append(metric_to_float(metrics, "alpha_b_y_mean"))
+            train_info_a_y_means.append(metric_to_float(metrics, "info_a_y_mean"))
+            train_info_b_y_means.append(metric_to_float(metrics, "info_b_y_mean"))
 
         train_losses.append(loss)
         train_accs.append(acc)
@@ -668,6 +917,10 @@ def print_config(args, steps_per_epoch: int, test_steps: int):
 
     print(f"Augmentation:       {args.aug}")
     print(f"Batch size:         {args.batch_size}")
+    print(f"Use pmap:           {args.use_pmap}")
+    print(f"Local devices:      {jax.local_device_count()}")
+    if args.use_pmap:
+        print(f"Per-device batch:   {args.batch_size // jax.local_device_count()}")
     print(f"Epochs:             {args.epochs}")
     print(f"Train steps/epoch:  {steps_per_epoch}")
     print(f"Eval steps/epoch:   {test_steps}")
@@ -724,6 +977,17 @@ def main():
         steps_per_epoch=steps_per_epoch,
     )
 
+    if args.use_pmap:
+        n_devices = jax.local_device_count()
+        if n_devices < 2:
+            raise ValueError("--use-pmap was set, but JAX sees fewer than 2 local devices.")
+        if args.batch_size % n_devices != 0:
+            raise ValueError(
+                f"Global batch size {args.batch_size} must be divisible by local_device_count {n_devices}."
+            )
+        print(f"Replicating TrainState across {n_devices} devices...")
+        state = jax_utils.replicate(state)
+
     print_config(args, steps_per_epoch, test_steps)
 
     csv_path = get_csv_path(args)
@@ -747,8 +1011,10 @@ def main():
                 steps_per_epoch=steps_per_epoch,
             )
 
+            eval_state = jax_utils.unreplicate(state) if args.use_pmap else state
+
             test_metrics = run_epoch_eval(
-                state=state,
+                state=eval_state,
                 test_ds=test_ds,
                 epoch=epoch,
                 test_steps=test_steps,
