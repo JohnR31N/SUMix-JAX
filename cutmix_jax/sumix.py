@@ -164,11 +164,11 @@ def sumix_loss(
     lam_area = lam_area.reshape(-1)
 
     # Official-style scalar CE reduction before lambda weighting.
-    ce_a_scalar = jnp.mean(cross_entropy_with_integer_labels(cls_mix, labels_a))
-    ce_b_scalar = jnp.mean(cross_entropy_with_integer_labels(cls_mix, labels_b))
+    ce_a = cross_entropy_with_integer_labels(cls_mix, labels_a)  # [B]
+    ce_b = cross_entropy_with_integer_labels(cls_mix, labels_b)  # [B]
 
     cls_loss = jnp.mean(
-        ce_a_scalar * lam_sumix + ce_b_scalar * (1.0 - lam_sumix)
+        ce_a * lam_sumix + ce_b * (1.0 - lam_sumix)
     )
 
     # Official regularization path: INa_f = exp(-(beta + alpha)).
@@ -179,11 +179,11 @@ def sumix_loss(
         ratio_info["alpha_b"] + ratio_info["beta_b"]
     ))
 
-    reg_ce_a_scalar = jnp.mean(cross_entropy_with_integer_labels(reg_logits_a, labels_a))
-    reg_ce_b_scalar = jnp.mean(cross_entropy_with_integer_labels(reg_logits_b, labels_b))
+    reg_ce_a = cross_entropy_with_integer_labels(reg_logits_a, labels_a)  # [B]
+    reg_ce_b = cross_entropy_with_integer_labels(reg_logits_b, labels_b)  # [B]
 
     reg_loss = jnp.mean(
-        reg_ce_a_scalar * lam_area + reg_ce_b_scalar * (1.0 - lam_area)
+        reg_ce_a * lam_area + reg_ce_b * (1.0 - lam_area)
     )
 
     total_loss = cls_loss + gamma * reg_loss
