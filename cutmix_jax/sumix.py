@@ -86,15 +86,23 @@ def estimate_mixup_ratio(
     semantic_one_masked = zero_out_label(semantic_one, labels_b)
     semantic_b_masked = zero_out_label(semantic_b, labels_a)
 
-    alpha_a = l2_normalize(
+    # Raw semantic discrepancy before scaling.
+    # This helps diagnose whether collapse comes from alpha_scale.
+    raw_alpha_a = l2_normalize(
         jnn.softmax(semantic_mix - semantic_one_masked, axis=-1),
         axis=-1,
-    ) * alpha_scale
+    )
 
-    alpha_b = l2_normalize(
+    raw_alpha_b = l2_normalize(
         jnn.softmax(semantic_mix - semantic_b_masked, axis=-1),
         axis=-1,
-    ) * alpha_scale
+    )
+
+    # Scaled semantic discrepancy.
+    # Official SUMix uses alpha_scale = batch_size.
+    # Stable JAX adaptation may use smaller values such as 4.
+    alpha_a = raw_alpha_a * alpha_scale
+    alpha_b = raw_alpha_b * alpha_scale
 
     uncertain_one = estimate_uncertainty(uncertain_one)
     uncertain_mix = estimate_uncertainty(uncertain_mix)
@@ -118,6 +126,8 @@ def estimate_mixup_ratio(
     lam_sumix = jnp.clip(lam_sumix, 0.0, 1.0)
 
     return lam_sumix, {
+        "raw_alpha_a": raw_alpha_a,
+        "raw_alpha_b": raw_alpha_b,
         "alpha_a": alpha_a,
         "alpha_b": alpha_b,
         "beta_a": beta_a,
@@ -196,8 +206,22 @@ def sumix_loss(
         "cls_loss": cls_loss,
         "reg_loss": reg_loss,
         "total_loss": total_loss,
-        "alpha_a_y_mean": jnp.mean(gather_by_label(ratio_info["alpha_a"], labels_a)),
-        "alpha_b_y_mean": jnp.mean(gather_by_label(ratio_info["alpha_b"], labels_b)),
-        "info_a_y_mean": jnp.mean(gather_by_label(ratio_info["info_a"], labels_a)),
-        "info_b_y_mean": jnp.mean(gather_by_label(ratio_info["info_b"], labels_b)),
+        "raw_alpha_a_y_mean": jnp.mean(
+            gather_by_label(ratio_info["raw_alpha_a"], labels_a)
+        ),
+        "raw_alpha_b_y_mean": jnp.mean(
+            gather_by_label(ratio_info["raw_alpha_b"], labels_b)
+        ),
+        "alpha_a_y_mean": jnp.mean(
+            gather_by_label(ratio_info["alpha_a"], labels_a)
+        ),
+        "alpha_b_y_mean": jnp.mean(
+            gather_by_label(ratio_info["alpha_b"], labels_b)
+        ),
+        "info_a_y_mean": jnp.mean(
+            gather_by_label(ratio_info["info_a"], labels_a)
+        ),
+        "info_b_y_mean": jnp.mean(
+            gather_by_label(ratio_info["info_b"], labels_b)
+        ),
     }
