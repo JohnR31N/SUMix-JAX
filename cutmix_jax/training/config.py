@@ -2,7 +2,7 @@ import argparse
 
 import optax
 
-from cutmix_jax.datasets import get_cifar10_dataset
+from cutmix_jax.datasets import get_cifar10_dataset, get_cifar100_dataset
 from cutmix_jax.models.small_cnn import SmallCNN
 from cutmix_jax.models.pyramidnet import PyramidNet
 from cutmix_jax.models.resnet import ResNet18
@@ -11,7 +11,12 @@ from cutmix_jax.models.resnet import ResNet18
 def parse_args():
     parser = argparse.ArgumentParser(description="Generic JAX training script")
 
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10"])
+    parser.add_argument(
+    "--dataset",
+    type=str,
+    default="cifar10",
+    choices=["cifar10", "cifar100"],
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -86,6 +91,45 @@ def create_model(args, num_classes: int):
 
 
 def create_datasets(dataset_name: str, batch_size: int, data_dir: str):
+    if dataset_name == "cifar10":
+        train_ds = get_cifar10_dataset(
+            split="train",
+            batch_size=batch_size,
+            shuffle=True,
+            data_dir=data_dir,
+        )
+        test_ds = get_cifar10_dataset(
+            split="test",
+            batch_size=batch_size,
+            shuffle=False,
+            data_dir=data_dir,
+        )
+
+        num_classes = 10
+        num_train_examples = 50000
+        num_test_examples = 10000
+        return train_ds, test_ds, num_classes, num_train_examples, num_test_examples
+
+    if dataset_name == "cifar100":
+        train_ds = get_cifar100_dataset(
+            split="train",
+            batch_size=batch_size,
+            shuffle=True,
+            data_dir=data_dir,
+        )
+        test_ds = get_cifar100_dataset(
+            split="test",
+            batch_size=batch_size,
+            shuffle=False,
+            data_dir=data_dir,
+        )
+
+        num_classes = 100
+        num_train_examples = 50000
+        num_test_examples = 10000
+        return train_ds, test_ds, num_classes, num_train_examples, num_test_examples
+
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
     if dataset_name == "cifar10":
         train_ds = get_cifar10_dataset(
             split="train",
