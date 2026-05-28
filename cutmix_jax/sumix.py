@@ -64,8 +64,7 @@ def estimate_mixup_ratio(
     Official-alignment SUMix ratio correction with tunable alpha scaling.
 
     Official SUMix uses alpha_scale = batch_size.
-    Stable JAX adaptation uses alpha_scale = 1.
-    This parameter allows an alpha-scale sweep, e.g. 1, 4, 8, 16, 32, 64, 128.
+    Stable JAX adaptation uses a smaller alpha_scale, e.g. 4.
     """
     batch_size = labels_a.shape[0]
 
@@ -76,8 +75,7 @@ def estimate_mixup_ratio(
     semantic_one = estimate_semantic_information(cls_one)
     semantic_mix = estimate_semantic_information(cls_mix)
 
-    # Official uses cls_one.clone().detach() and cls_mix.clone().detach()
-    # before estimating semantic information.
+    # Official uses cls_one.clone().detach() and cls_mix.clone().detach().
     semantic_one = jax.lax.stop_gradient(semantic_one)
     semantic_mix = jax.lax.stop_gradient(semantic_mix)
 
@@ -86,8 +84,7 @@ def estimate_mixup_ratio(
     semantic_one_masked = zero_out_label(semantic_one, labels_b)
     semantic_b_masked = zero_out_label(semantic_b, labels_a)
 
-    # Raw semantic discrepancy before scaling.
-    # This helps diagnose whether collapse comes from alpha_scale.
+    # Raw semantic discrepancy before alpha scaling.
     raw_alpha_a = l2_normalize(
         jnn.softmax(semantic_mix - semantic_one_masked, axis=-1),
         axis=-1,
@@ -99,8 +96,8 @@ def estimate_mixup_ratio(
     )
 
     # Scaled semantic discrepancy.
-    # Official SUMix uses alpha_scale = batch_size.
-    # Stable JAX adaptation may use smaller values such as 4.
+    # Official-equivalent: alpha_scale = batch_size.
+    # Stable JAX adaptation: alpha_scale = 4, 8, 32, etc.
     alpha_a = raw_alpha_a * alpha_scale
     alpha_b = raw_alpha_b * alpha_scale
 
@@ -120,8 +117,8 @@ def estimate_mixup_ratio(
     lam_a = lam_area * info_a_y
     lam_b = (1.0 - lam_area) * info_b_y
 
-    # Official code does not add epsilon, but JAX/TPU can underflow to zero here.
-    # A tiny epsilon prevents NaNs while preserving the official form for diagnostics.
+    # Official code does not add epsilon, but JAX/TPU can underflow to zero.
+    # This tiny epsilon prevents NaNs while preserving the diagnostic behavior.
     lam_sumix = lam_a / (lam_a + lam_b + 1e-12)
     lam_sumix = jnp.clip(lam_sumix, 0.0, 1.0)
 
@@ -150,12 +147,13 @@ def sumix_loss(
     alpha_scale: float = 1.0,
 ):
     """
-    Official-alignment SUMix loss.
+    SUMix loss with raw-alpha diagnostics.
 
-    Differences from stable JAX adaptation:
-    - Uses a tunable alpha_scale. Use alpha_scale=batch_size for official-style scaling.
-    - Uses official-style scalar CE reduction before lambda weighting.
-    - Uses exp(-(alpha + beta)) for the regularization logits/features.
+    Main reproduction behavior:
+    - Keeps original scalar CE reduction before lambda weighting.
+    - Keeps raw_alpha logging for diagnosing alpha scaling collapse.
+    - Uses exp(-alpha) for semantic information weights.
+    - Uses exp(-(alpha + beta)) for uncertainty regularization.
     """
     lam_sumix, ratio_info = estimate_mixup_ratio(
         cls_one=cls_one,
@@ -173,12 +171,16 @@ def sumix_loss(
         lam_area = jnp.ones_like(lam_sumix) * lam_area
     lam_area = lam_area.reshape(-1)
 
-    # Official-style scalar CE reduction before lambda weighting.
-    ce_a = cross_entropy_with_integer_labels(cls_mix, labels_a)  # [B]
-    ce_b = cross_entropy_with_integer_labels(cls_mix, labels_b)  # [B]
+    # Original scalar CE reduction behavior.
+    ce_a_scalar = jnp.mean(
+        cross_entropy_with_integer_labels(cls_mix, labels_a)
+    )
+    ce_b_scalar = jnp.mean(
+        cross_entropy_with_integer_labels(cls_mix, labels_b)
+    )
 
     cls_loss = jnp.mean(
-        ce_a * lam_sumix + ce_b * (1.0 - lam_sumix)
+        ce_a_scalar * lam_sumix + ce_b_scalar * (1.0 - lam_sumix)
     )
 
     # Official regularization path: INa_f = exp(-(beta + alpha)).
@@ -189,11 +191,16 @@ def sumix_loss(
         ratio_info["alpha_b"] + ratio_info["beta_b"]
     ))
 
-    reg_ce_a = cross_entropy_with_integer_labels(reg_logits_a, labels_a)  # [B]
-    reg_ce_b = cross_entropy_with_integer_labels(reg_logits_b, labels_b)  # [B]
+    # Original scalar CE reduction behavior for regularization.
+    reg_ce_a_scalar = jnp.mean(
+        cross_entropy_with_integer_labels(reg_logits_a, labels_a)
+    )
+    reg_ce_b_scalar = jnp.mean(
+        cross_entropy_with_integer_labels(reg_logits_b, labels_b)
+    )
 
     reg_loss = jnp.mean(
-        reg_ce_a * lam_area + reg_ce_b * (1.0 - lam_area)
+        reg_ce_a_scalar * lam_area + reg_ce_b_scalar * (1.0 - lam_area)
     )
 
     total_loss = cls_loss + gamma * reg_loss
@@ -206,18 +213,24 @@ def sumix_loss(
         "cls_loss": cls_loss,
         "reg_loss": reg_loss,
         "total_loss": total_loss,
+
+        # Raw alpha before alpha_scale.
         "raw_alpha_a_y_mean": jnp.mean(
             gather_by_label(ratio_info["raw_alpha_a"], labels_a)
         ),
         "raw_alpha_b_y_mean": jnp.mean(
             gather_by_label(ratio_info["raw_alpha_b"], labels_b)
         ),
+
+        # Scaled alpha after alpha_scale.
         "alpha_a_y_mean": jnp.mean(
             gather_by_label(ratio_info["alpha_a"], labels_a)
         ),
         "alpha_b_y_mean": jnp.mean(
             gather_by_label(ratio_info["alpha_b"], labels_b)
         ),
+
+        # Information weights.
         "info_a_y_mean": jnp.mean(
             gather_by_label(ratio_info["info_a"], labels_a)
         ),
